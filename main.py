@@ -233,6 +233,9 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent | ImageCo
         
         client = await get_protect_client()
         
+        # Always refresh bootstrap data so we return live state
+        await client.update()
+        
         if name == "list_cameras":
             result_cameras = []
             
@@ -454,9 +457,6 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent | ImageCo
             return [TextContent(type="text", text=json.dumps(result, indent=2))]
         
         elif name == "list_adoptable_devices":
-            # Refresh bootstrap to discover new devices
-            await client.update()
-            
             adoptable = []
             device_collections = {
                 "camera": (client.bootstrap.cameras, ModelType.CAMERA),
@@ -506,9 +506,6 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent | ImageCo
             if not device_id:
                 return [TextContent(type="text", text="Error: device_id required")]
             
-            # Refresh to find newly visible devices
-            await client.update()
-            
             device, dev_type = await find_any_device(client, device_id)
             if not device:
                 return [TextContent(type="text", text=f"Error: Device '{device_id}' not found. Use list_adoptable_devices to see available devices.")]
@@ -536,9 +533,6 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent | ImageCo
             device_name = arguments.get("name")
             if not device_id:
                 return [TextContent(type="text", text="Error: device_id required")]
-            
-            # Refresh to find newly visible devices
-            await client.update()
             
             device, dev_type = await find_any_device(client, device_id)
             
