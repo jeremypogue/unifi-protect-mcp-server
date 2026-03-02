@@ -13,7 +13,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent, ImageContent
 from uiprotect import ProtectApiClient
-from uiprotect.data.types import ModelType
+from uiprotect.data.types import ModelType, EventType, SmartDetectObjectType
 
 # Directory for saving snapshots/videos
 MEDIA_DIR = Path(os.getenv("UNIFI_PROTECT_MEDIA_DIR", "/tmp/unifi-protect-media"))
@@ -219,6 +219,49 @@ async def list_tools() -> list[Tool]:
                     "device_id": {"type": "string", "description": "Device ID, name, or MAC address"},
                 },
                 "required": ["device_id"],
+            },
+        ),
+        Tool(
+            name="list_events",
+            description="List events from UniFi Protect (motion, smart detections, camera connect/disconnect, etc.). "
+                        "Filter by camera, event type, smart detect type, category, and time range. "
+                        "Returns events sorted by most recent first by default.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "camera_id": {"type": "string", "description": "Camera ID or name to filter events for a specific camera (optional)"},
+                    "event_type": {
+                        "type": "string",
+                        "description": "Event type filter (optional). Common values: motion, smartDetectZone, smartDetectLine, "
+                                       "ring, disconnect, cameraConnected, cameraDisconnected, sensorMotion, sensorOpened, sensorClosed",
+                    },
+                    "smart_detect_type": {
+                        "type": "string",
+                        "description": "Smart detection type filter (optional). Values: person, animal, vehicle, licensePlate, "
+                                       "package, face, car, pet, alrmSmoke, alrmBabyCry, alrmSpeak, alrmBark, alrmGlassBreak",
+                    },
+                    "category": {
+                        "type": "string",
+                        "description": "Event category filter (optional)",
+                        "enum": ["critical", "update", "admin", "ring", "motion", "smart", "iot"],
+                    },
+                    "hours_back": {"type": "number", "description": "How many hours back to search (default: 24, max: 168)"},
+                    "limit": {"type": "integer", "description": "Maximum number of events to return (default: 25, max: 100)"},
+                },
+            },
+        ),
+        Tool(
+            name="get_event_thumbnail",
+            description="Get the thumbnail image for a specific UniFi Protect event. Returns the image as base64-encoded JPEG. "
+                        "Use list_events first to find event IDs with thumbnails.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "event_id": {"type": "string", "description": "Event ID to get the thumbnail for"},
+                    "width": {"type": "integer", "description": "Thumbnail width in pixels (optional)"},
+                    "height": {"type": "integer", "description": "Thumbnail height in pixels (optional)"},
+                },
+                "required": ["event_id"],
             },
         ),
     ]
@@ -604,6 +647,165 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent | ImageCo
                 return [TextContent(type="text", text=f"Device '{dev_display}' ({dev_type}) has been unadopted/unmanaged from this NVR.")]
             except Exception as e:
                 return [TextContent(type="text", text=f"Error unadopting device: {str(e)}")]
+        
+        elif name == "list_events":
+            # Time range
+            hours_back = min(arguments.get("hours_back", 24), 168)
+            end_time = datetime.now(timezone.utc)
+            start_time = end_time - timedelta(hours=hours_back)
+            limit = min(arguments.get("limit", 25), 100)
+            
+            # Build filter kwargs
+            get_events_kwargs: dict[str, Any] = {
+                "start": start_time,
+                "end": end_time,
+                "limit": limit,
+                "sorting": "desc",
+                "descriptions": True,
+            }
+            
+            # Event type filter
+            event_type_str = arguments.get("event_type")
+            if event_type_str:
+                # Match by EventType value
+                matched_type = None
+                for et in EventType:
+                    if et.value == event_type_str or et.value.lower() == event_type_str.lower():
+                        matched_type = et
+                        break
+                if matched_type:
+                    get_events_kwargs["types"] = [matched_type]
+                else:
+                    return [TextContent(type="text", text=f"Error: Unknown event_type '{event_type_str}'. Use values like: motion, smartDetectZone, ring, disconnect, cameraConnected, cameraDisconnected")]
+            
+            # Smart detect type filter
+            smart_type_str = arguments.get("smart_detect_type")
+            if smart_type_str:
+                matched_smart = None
+                for st in SmartDetectObjectType:
+                    if st.value == smart_type_str or st.value.lower() == smart_type_str.lower():
+                        matched_smart = st
+                        break
+                if matched_smart:
+                    get_events_kwargs["smart_detect_types"] = [matched_smart]
+                else:
+                    return [TextContent(type="text", text=f"Error: Unknown smart_detect_type '{smart_type_str}'. Use values like: person, animal, vehicle, licensePlate, package, face")]
+            
+            # Category filter
+            category_str = arguments.get("category")
+            if category_str:
+                get_events_kwargs["category"] = category_str
+            
+            # Fetch events
+            events = await client.get_events(**get_events_kwargs)
+            
+            # Camera filter (post-query since get_events doesn't have a camera param)
+            camera_id_filter = arguments.get("camera_id")
+            target_camera_id = None
+            if camera_id_filter:
+                cam = await find_camera(client, camera_id_filter)
+                if not cam:
+                    return [TextContent(type="text", text=f"Error: Camera '{camera_id_filter}' not found")]
+                target_camera_id = cam.id
+            
+            # Build camera name lookup
+            cam_names = {cid: c.name for cid, c in client.bootstrap.cameras.items()}
+            
+            result_events = []
+            for event in events:
+                # Filter by camera if specified
+                if target_camera_id and event.camera_id != target_camera_id:
+                    continue
+                
+                evt = {
+                    "id": event.id,
+                    "type": event.type.value if hasattr(event.type, 'value') else str(event.type),
+                    "start": event.start.isoformat() if event.start else None,
+                    "end": event.end.isoformat() if event.end else None,
+                    "score": event.score,
+                    "camera_id": event.camera_id,
+                    "camera_name": cam_names.get(event.camera_id, None),
+                }
+                
+                if event.smart_detect_types:
+                    evt["smart_detect_types"] = [s.value for s in event.smart_detect_types]
+                
+                if event.category:
+                    evt["category"] = event.category
+                
+                if event.thumbnail_id:
+                    evt["has_thumbnail"] = True
+                    evt["thumbnail_id"] = event.thumbnail_id
+                
+                if event.heatmap_id:
+                    evt["has_heatmap"] = True
+                
+                result_events.append(evt)
+            
+            result = {
+                "total_returned": len(result_events),
+                "time_range": {
+                    "start": start_time.isoformat(),
+                    "end": end_time.isoformat(),
+                    "hours_back": hours_back,
+                },
+                "events": result_events,
+            }
+            return [TextContent(type="text", text=json.dumps(result, indent=2))]
+        
+        elif name == "get_event_thumbnail":
+            event_id = arguments.get("event_id")
+            if not event_id:
+                return [TextContent(type="text", text="Error: event_id required")]
+            
+            width = arguments.get("width")
+            height = arguments.get("height")
+            
+            # First get the event to find the thumbnail_id
+            try:
+                event = await client.get_event(event_id)
+            except Exception as e:
+                return [TextContent(type="text", text=f"Error: Could not find event '{event_id}': {str(e)}")]
+            
+            if not event.thumbnail_id:
+                return [TextContent(type="text", text=f"Error: Event '{event_id}' has no thumbnail")]
+            
+            # Fetch the thumbnail
+            thumb_bytes = await client.get_event_thumbnail(
+                event.thumbnail_id,
+                width=width,
+                height=height,
+            )
+            
+            if not thumb_bytes:
+                return [TextContent(type="text", text=f"Error: Failed to retrieve thumbnail for event '{event_id}'")]
+            
+            # Save to file
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"event_thumb_{event_id[:12]}_{timestamp}.jpg"
+            filepath = MEDIA_DIR / filename
+            filepath.write_bytes(thumb_bytes)
+            
+            # Build camera name
+            cam_names = {cid: c.name for cid, c in client.bootstrap.cameras.items()}
+            
+            b64_data = base64.b64encode(thumb_bytes).decode("utf-8")
+            meta = {
+                "event_id": event.id,
+                "event_type": event.type.value if hasattr(event.type, 'value') else str(event.type),
+                "camera_name": cam_names.get(event.camera_id, None),
+                "start": event.start.isoformat() if event.start else None,
+                "score": event.score,
+                "file": str(filepath),
+                "size_bytes": len(thumb_bytes),
+            }
+            if event.smart_detect_types:
+                meta["smart_detect_types"] = [s.value for s in event.smart_detect_types]
+            
+            return [
+                ImageContent(type="image", data=b64_data, mimeType="image/jpeg"),
+                TextContent(type="text", text=json.dumps(meta, indent=2)),
+            ]
         
         else:
             return [TextContent(type="text", text=f"Error: Unknown tool '{name}'")]
