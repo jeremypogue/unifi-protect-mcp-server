@@ -869,16 +869,21 @@ async def main():
             ],
         )
 
+        ssl_certfile = os.getenv("MCP_SSL_CERTFILE", "/home/vision/.ssl/mcp.crt")
+        ssl_keyfile = os.getenv("MCP_SSL_KEYFILE", "/home/vision/.ssl/mcp.key")
+
         logger = logging.getLogger("unifi-protect-mcp")
         logging.basicConfig(level=logging.INFO)
         logger.info(f"Starting UniFi Protect MCP SSE server on {args.host}:{args.port}")
-        logger.info(f"SSE endpoint: http://{args.host}:{args.port}/sse")
+        logger.info(f"SSE endpoint: https://{args.host}:{args.port}/sse")
 
         config = uvicorn.Config(
             starlette_app,
             host=args.host,
             port=args.port,
             log_level="info",
+            ssl_certfile=ssl_certfile,
+            ssl_keyfile=ssl_keyfile,
         )
         server = uvicorn.Server(config)
         await server.serve()
