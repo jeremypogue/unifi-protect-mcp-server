@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """UniFi Protect MCP Server - Built from scratch for mcporter compatibility"""
 
+import argparse
 import asyncio
 import base64
 import json
+import logging
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -11,9 +13,14 @@ from typing import Any, Sequence
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
+from mcp.server.sse import SseServerTransport
 from mcp.types import Tool, TextContent, ImageContent
+from starlette.applications import Starlette
+from starlette.responses import Response
+from starlette.routing import Mount, Route
 from uiprotect import ProtectApiClient
 from uiprotect.data.types import ModelType, EventType, SmartDetectObjectType
+import uvicorn
 
 # Directory for saving snapshots/videos
 MEDIA_DIR = Path(os.getenv("UNIFI_PROTECT_MEDIA_DIR", "/tmp/unifi-protect-media"))
@@ -818,8 +825,63 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent | ImageCo
 
 async def main():
     """Run the MCP server"""
-    async with stdio_server() as (read_stream, write_stream):
-        await app.run(read_stream, write_stream, app.create_initialization_options())
+    parser = argparse.ArgumentParser(description="UniFi Protect MCP Server")
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "sse"],
+        default=os.getenv("MCP_TRANSPORT", "sse"),
+        help="Transport type (default: sse, or set MCP_TRANSPORT env var)",
+    )
+    parser.add_argument(
+        "--host",
+        default=os.getenv("MCP_HOST", "0.0.0.0"),
+        help="Host to bind SSE server (default: 0.0.0.0)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.getenv("MCP_PORT", "8001")),
+        help="Port for SSE server (default: 8001)",
+    )
+    args = parser.parse_args()
+
+    if args.transport == "stdio":
+        async with stdio_server() as (read_stream, write_stream):
+            await app.run(read_stream, write_stream, app.create_initialization_options())
+    else:
+        # SSE transport
+        sse = SseServerTransport("/messages/")
+
+        async def handle_sse(request):
+            async with sse.connect_sse(
+                request.scope, request.receive, request._send
+            ) as streams:
+                await app.run(
+                    streams[0], streams[1], app.create_initialization_options()
+                )
+            return Response()
+
+        starlette_app = Starlette(
+            debug=False,
+            routes=[
+                Route("/sse", endpoint=handle_sse),
+                Mount("/messages/", app=sse.handle_post_message),
+            ],
+        )
+
+        logger = logging.getLogger("unifi-protect-mcp")
+        logging.basicConfig(level=logging.INFO)
+        logger.info(f"Starting UniFi Protect MCP SSE server on {args.host}:{args.port}")
+        logger.info(f"SSE endpoint: http://{args.host}:{args.port}/sse")
+
+        config = uvicorn.Config(
+            starlette_app,
+            host=args.host,
+            port=args.port,
+            log_level="info",
+        )
+        server = uvicorn.Server(config)
+        await server.serve()
 
 
 if __name__ == "__main__":
