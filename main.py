@@ -869,22 +869,24 @@ async def main():
             ],
         )
 
-        ssl_certfile = os.getenv("MCP_SSL_CERTFILE", "/home/vision/.ssl/mcp.crt")
-        ssl_keyfile = os.getenv("MCP_SSL_KEYFILE", "/home/vision/.ssl/mcp.key")
-
         logger = logging.getLogger("unifi-protect-mcp")
         logging.basicConfig(level=logging.INFO)
-        logger.info(f"Starting UniFi Protect MCP SSE server on {args.host}:{args.port}")
-        logger.info(f"SSE endpoint: https://{args.host}:{args.port}/sse")
 
-        config = uvicorn.Config(
-            starlette_app,
-            host=args.host,
-            port=args.port,
-            log_level="info",
-            ssl_certfile=ssl_certfile,
-            ssl_keyfile=ssl_keyfile,
-        )
+        ssl_enabled = os.getenv("MCP_SSL_ENABLED", "false").lower() == "true"
+        uvi_kwargs: dict[str, Any] = {
+            "host": args.host,
+            "port": args.port,
+            "log_level": "info",
+        }
+        if ssl_enabled:
+            uvi_kwargs["ssl_certfile"] = os.getenv("MCP_SSL_CERTFILE", "/home/vision/.ssl/mcp.crt")
+            uvi_kwargs["ssl_keyfile"] = os.getenv("MCP_SSL_KEYFILE", "/home/vision/.ssl/mcp.key")
+
+        scheme = "https" if ssl_enabled else "http"
+        logger.info(f"Starting UniFi Protect MCP SSE server on {args.host}:{args.port}")
+        logger.info(f"SSE endpoint: {scheme}://{args.host}:{args.port}/sse")
+
+        config = uvicorn.Config(starlette_app, **uvi_kwargs)
         server = uvicorn.Server(config)
         await server.serve()
 
